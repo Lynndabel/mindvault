@@ -73,6 +73,7 @@ import {
   TOOL_ARGUMENT_SPECS,
   TOOLS_WITHOUT_ARG_VALIDATION,
   UnknownToolError,
+  requiredStringArray,
   validateToolArgs,
   type ValidatedArgs,
 } from "./validation.js";
@@ -143,7 +144,7 @@ import {
   mapSponsoredTransportFailure,
   SPONSORED_CREATE_PATH,
 } from "./sponsoredDiagnostics.js";
-import { parseMetadataHash } from "./metadataHash.js";
+import { describeMetadataPointerHash, parseMetadataHash } from "./metadataHash.js";
 import {
   applyCatalogSort,
   applyClientCatalogFilters,
@@ -2234,6 +2235,287 @@ export async function registryList(start: number, limit: number): Promise<string
   );
 }
 
+/**
+ * Look up several catalog resources in one call (#608).
+ *
+ * Each id is resolved exactly like `mindvault_preview` — same endpoint, same
+ * offline fallback to the last recorded snapshot, same staleness labelling —
+ * but a miss here is a *result* (`found: false`), not an error: one unknown id
+ * must not sink a batch that is otherwise answerable. Deduplicated up front so
+ * a repeated id costs one lookup, and the advertised batch ceiling (25) keeps
+ * the fan-out bounded.
+ */
+async function batchCatalogLookupOutcome(
+  resourceIds: string[],
+  refetch: boolean,
+): Promise<ToolOutcome> {
+  const uniqueIds = [...new Set(resourceIds)];
+
+  // Offline fallback: resolve what the last recorded snapshots can answer.
+  // Called when the freshness probe proves the API unreachable (or refetch is
+  // false and the probe failed for any reason); throws a classified error when
+  // no snapshot can answer any part of the batch.
+  const resolveOffline = async (): Promise<Map<string, { meta: any; savedAtMs: number }>> => {
+    const fromCache = new Map<string, { meta: any; savedAtMs: number }>();
+    for (const id of uniqueIds) {
+      const snap = getPreviewSnapshot(id);
+      if (snap) fromCache.set(id, { meta: snap.meta, savedAtMs: snap.savedAtMs });
+    }
+    if (fromCache.size === 0) {
+      throw mcpError(
+        mapTransportError({
+          operation: `Batch lookup failed for ${uniqueIds.length} resource(s) and no cached snapshot is available`,
+          source: "api",
+          error: new Error("catalog API unreachable"),
+        }),
+      );
+    }
+    return fromCache;
+  };
+
+  const cached = new Map<string, { meta: any; savedAtMs: number }>();
+  const snapshotServed: string[] = [];
+  try {
+    // Freshness probe: a cheap single-id read exercises the same transport as
+    // the batch. Its outcome settles the first id (hit or miss), so no id pays
+    // for a second request; any other status means the API, not the id,
+    // failed — the offline fallback below decides whether that is survivable.
+    const probe = await jsonFetch(`${BASE_URL}/resources/${uniqueIds[0]}/meta`);
+    if (!probe.ok && probe.status !== 404) {
+      throwHttpError({
+        operation: "Batch lookup failed",
+        source: "api",
+        status: probe.status,
+        data: probe.data,
+      });
+    }
+    if (probe.ok) recordPreviewSnapshot(uniqueIds[0], probe.data);
+    for (const id of uniqueIds) {
+      if (id === uniqueIds[0]) {
+        if (probe.ok) {
+          cached.set(id, { meta: probe.data, savedAtMs: Date.now() });
+        } else if (!refetch) {
+          // 404 for the probe id: same per-id semantics as every other id —
+          // the last snapshot can still answer (mirrors previewData), unless
+          // refetch asked for fresh answers only.
+          const snap = getPreviewSnapshot(id);
+          if (snap) {
+            cached.set(id, { meta: snap.meta, savedAtMs: snap.savedAtMs });
+            snapshotServed.push(id);
+          }
+        }
+        continue;
+      }
+      // Per-id semantics mirror previewData: any failure to read one id —
+      // a 404, an API error status, or a transport error while the probe is
+      // healthy — degrades that id to a snapshot-or-miss instead of failing
+      // the batch. Only the probe decides whether the API as a whole is
+      // unreachable, and refetch refuses the snapshot everywhere.
+      try {
+        const res = await jsonFetch(`${BASE_URL}/resources/${id}/meta`);
+        if (res.ok) {
+          recordPreviewSnapshot(id, res.data);
+          cached.set(id, { meta: res.data, savedAtMs: Date.now() });
+          continue;
+        }
+      } catch {
+        // Mid-batch transport failure while the probe is healthy: degrade
+        // this id below; never escalate to the batch-level offline path,
+        // because the API as a whole is reachable.
+      }
+      if (!refetch) {
+        const snap = getPreviewSnapshot(id);
+        if (snap) {
+          cached.set(id, { meta: snap.meta, savedAtMs: snap.savedAtMs });
+          snapshotServed.push(id);
+        }
+      }
+    }
+  } catch (err) {
+    if (refetch) throw err;
+    const offline = await resolveOffline();
+    for (const [id, entry] of offline) {
+      cached.set(id, entry);
+      snapshotServed.push(id);
+    }
+  }
+
+  // The snapshot notice is claimed per id, not per batch: it lists exactly
+  // the ids that were answered from cache, so it never labels data that was
+  // read live. Mixed batches (a fresh probe plus later failures) therefore
+  // name the degraded subset.
+  let notice: string | null = null;
+  if (snapshotServed.length > 0) {
+    const oldestServed = Math.min(
+      ...snapshotServed.map((id) => cached.get(id)!.savedAtMs),
+    );
+    notice = catalogCacheLabel(oldestServed);
+    if (snapshotServed.length < uniqueIds.length) {
+      notice = `${notice} (served from cache: ${snapshotServed.join(", ")})`;
+    }
+  }
+
+  const missing: string[] = [];
+  const bodyLines: string[] = [];
+  const items: Array<{
+    id: string;
+    found: boolean;
+    title: string | null;
+    price: string | number | null;
+    verificationStatus: string | null;
+    resourceType: string | null;
+    accessUrl: string | null;
+  }> = [];
+
+  for (const id of uniqueIds) {
+    const entry = cached.get(id);
+    if (!entry || !entry.meta) {
+      missing.push(id);
+      items.push({
+        id,
+        found: false,
+        title: null,
+        price: null,
+        verificationStatus: null,
+        resourceType: null,
+        accessUrl: null,
+      });
+      bodyLines.push(`[${id}] not found in the catalog.`);
+      continue;
+    }
+    const r = entry.meta;
+    items.push({
+      id,
+      found: true,
+      title: r?.title ?? null,
+      price: r?.price ?? null,
+      verificationStatus: r?.verificationStatus ?? null,
+      resourceType: r?.resourceType ?? null,
+      accessUrl: r?.accessUrl ?? null,
+    });
+    bodyLines.push(
+      `[${r.id ?? id}] ${r?.title ?? "(untitled)"} — $${r?.price ?? "?"} USDC\n  ${r?.description ?? ""}\n  ${r?.accessUrl ?? ""}`,
+    );
+  }
+
+  const body = bodyLines.join("\n\n");
+  const full = notice ? `${body}\n\n${notice}` : body;
+  const text = truncateResponse(full);
+  return {
+    text,
+    structured: {
+      items,
+      requested: uniqueIds.length,
+      foundCount: items.filter((i) => i.found).length,
+      missing,
+      notice,
+      truncated: text !== full,
+    },
+  };
+}
+
+export async function batchCatalogLookup(
+  resourceIds: string[],
+  refetch: boolean,
+): Promise<string> {
+  return outcomeText(await batchCatalogLookupOutcome(resourceIds, refetch));
+}
+
+/**
+ * Preview the content digest anchored in a resource's on-chain metadata
+ * pointer (#604), without comparing it against anything or buying the
+ * resource.
+ *
+ * Reads the same on-chain row `mindvault_check_consistency` reads, then hands
+ * the pointer to the shared `describeMetadataPointerHash` reporter so the
+ * reason strings match that tool's report exactly. Unknown ids surface the
+ * registry client's own not-found error rather than a synthetic report — an
+ * id that does not exist is an input problem, not a digest problem.
+ */
+async function previewMetadataHashOutcome(resourceId: string): Promise<ToolOutcome> {
+  let pointer: unknown;
+  let source: string | null = null;
+
+  if (_isMock()) {
+    const raw = mockRegistryLookup(resourceId, REGISTRY_CONTRACT_ID, currentWallet()?.publicKey);
+    const parsed = JSON.parse(raw);
+    if (!parsed.found) {
+      // Same semantics as the live path: an id that is not registered on-chain
+      // is an input problem, not a digest problem.
+      throw mcpError(
+        mapRegistryError({
+          operation: `Metadata hash preview for resource "${resourceId}"`,
+          message: `Resource "${resourceId}" is not registered on-chain.`,
+          notFound: true,
+        }),
+      );
+    }
+    pointer = parsed.metadata;
+    source = "on-chain (mock)";
+  } else {
+    const client = createRegistryClient({
+      contractId: REGISTRY_CONTRACT_ID,
+      rpcUrl: SOROBAN_RPC_URL,
+      networkPassphrase: REGISTRY_NETWORK_PASSPHRASE,
+    });
+    let tx: Awaited<ReturnType<typeof client.get>>;
+    try {
+      tx = await client.get({ id: resourceId });
+    } catch (err: any) {
+      throw mcpError(
+        mapTransportError({
+          operation: `Metadata hash preview failed for resource "${resourceId}" (contract ${REGISTRY_CONTRACT_ID}, RPC ${SOROBAN_RPC_URL})`,
+          source: "soroban",
+          error: err,
+        }),
+      );
+    }
+    if (tx.result.isErr()) {
+      const err = tx.result.unwrapErr();
+      if (err.message === RegistryErrors[2].message) {
+        throw mcpError(
+          mapRegistryError({
+            operation: `Metadata hash preview for resource "${resourceId}"`,
+            message: err.message,
+            notFound: true,
+          }),
+        );
+      }
+      throw mcpError(
+        mapRegistryError({
+          operation: `Contract error for resource "${resourceId}" (contract ${REGISTRY_CONTRACT_ID}, network ${REGISTRY_NETWORK_PASSPHRASE})`,
+          message: err.message,
+        }),
+      );
+    }
+    pointer = tx.result.unwrap().metadata;
+    source = "on-chain";
+  }
+
+  const report = describeMetadataPointerHash(pointer);
+  const structured = {
+    resourceId,
+    pointer: { source, present: typeof pointer === "string" && pointer.trim() !== "" },
+    report,
+  };
+  const lines = [
+    `Resource: ${resourceId}`,
+    `Metadata pointer source: ${source ?? "none"}`,
+    `Digest anchored: ${report.present ? "yes" : "no"}`,
+  ];
+  if (report.present && report.valid) {
+    lines.push(`Algorithm: ${report.algorithm}`, `Canonical digest: ${report.canonical}`);
+  } else {
+    lines.push(`Digest: ${report.reason ?? "not anchored"}`);
+  }
+  const text = truncateResponse(lines.join("\n"));
+  return { text, structured };
+}
+
+export async function previewMetadataHash(resourceId: string): Promise<string> {
+  return outcomeText(await previewMetadataHashOutcome(resourceId));
+}
+
 export async function recoverCatalogCache(): Promise<string> {
   if (_isMock()) {
     return JSON.stringify(
@@ -2634,6 +2916,13 @@ async function dispatchToolOutcome(
         );
       case "mindvault_registry_lookup":
         return registryLookup(requiredString(args, "resourceId"));
+      case "mindvault_batch_catalog_lookup":
+        return batchCatalogLookupOutcome(
+          requiredStringArray(args, "resourceIds"),
+          flag(args, "refetch"),
+        );
+      case "mindvault_preview_metadata_hash":
+        return previewMetadataHashOutcome(requiredString(args, "resourceId"));
       case "mindvault_registry_list":
         return registryList(
           optionalInt(args, "start", REGISTRY_LIST_DEFAULT_START),

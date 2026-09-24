@@ -71,6 +71,9 @@ on the failure rather than parse prose.
 |                                | `verificationStatus`   | no       | `pending`, `verified`, `rejected`, `skipped`     |
 |                                | `resourceType`         | no       | `file`, `link`                                   |
 | `mindvault_preview`            | `resourceId`           | yes      | letters, digits, dot, dash, underscore (≤128)    |
+| `mindvault_batch_catalog_lookup` | `resourceIds`        | yes      | 1–25 resource ids (array or comma-separated)     |
+|                                | `refetch`              | no       | boolean — skip the offline cache fallback        |
+| `mindvault_preview_metadata_hash` | `resourceId`         | yes      | letters, digits, dot, dash, underscore (≤128)    |
 | `mindvault_register`           | `name`                 | yes      | 1–128 characters                                 |
 |                                | `email`                | yes      | email address (≤254)                             |
 |                                | `walletAddress`        | no       | Stellar public key (`G…`, 56 chars)              |
@@ -126,6 +129,7 @@ accepted spelling the agent used:
 | flag                   | coerced to a real boolean     |
 | `txHash`               | lowercased bare hex           |
 | `expectedMetadataHash` | canonical `sha256:<hex>` form |
+| string_array           | per-entry trimmed, empties dropped; case and duplicates kept (unlike `tag_array`, entries are data selectors, not on-chain tags) |
 
 ---
 

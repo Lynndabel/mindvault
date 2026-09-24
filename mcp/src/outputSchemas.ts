@@ -385,6 +385,81 @@ export const RECOVER_CACHE_OUTPUT_SCHEMA = {
   required: ["source", "action", "message"],
 } as const;
 
+/**
+ * One entry of a batch catalog lookup result (#608).
+ *
+ * `found` is false with `null` metadata for a resource the API does not know —
+ * a miss is a result, not a failure, so one bad id cannot sink a batch.
+ */
+const BATCH_CATALOG_ITEM_SCHEMA = {
+  type: "object",
+  properties: {
+    id: { type: "string" },
+    found: { type: "boolean" },
+    title: { type: ["string", "null"] },
+    price: { type: ["string", "number", "null"] },
+    verificationStatus: { type: ["string", "null"] },
+    resourceType: { type: ["string", "null"] },
+    accessUrl: { type: ["string", "null"] },
+  },
+  required: [
+    "id",
+    "found",
+    "title",
+    "price",
+    "verificationStatus",
+    "resourceType",
+    "accessUrl",
+  ],
+} as const;
+
+export const BATCH_CATALOG_LOOKUP_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    items: { type: "array", items: BATCH_CATALOG_ITEM_SCHEMA },
+    requested: { type: "integer" },
+    foundCount: { type: "integer" },
+    missing: { type: "array", items: { type: "string" } },
+    notice: { type: ["string", "null"] },
+    truncated: { type: "boolean" },
+  },
+  required: ["items", "requested", "foundCount", "missing", "notice", "truncated"],
+} as const;
+
+/**
+ * Structured result for the metadata-hash preview tool (#604).
+ *
+ * `pointer` reports where the metadata pointer was read from, and `report`
+ * mirrors `MetadataHashReport` (see metadataHash.ts): the canonical digest
+ * when the pointer anchors one, or a deterministic reason when it does not.
+ */
+export const METADATA_HASH_PREVIEW_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    resourceId: { type: "string" },
+    pointer: {
+      type: "object",
+      properties: {
+        source: { type: ["string", "null"] },
+        present: { type: "boolean" },
+      },
+      required: ["source", "present"],
+    },
+    report: {
+      type: "object",
+      properties: {
+        present: { type: "boolean" },
+        valid: { type: "boolean" },
+        canonical: { type: ["string", "null"] },
+        algorithm: { type: ["string", "null"] },
+        reason: { type: ["string", "null"] },
+      },
+      required: ["present", "valid", "canonical", "algorithm", "reason"],
+    },
+  },
+  required: ["resourceId", "pointer", "report"],
+} as const;
+
 /** Tools that must stay text-only (no schema, no structuredContent). */
 export const TEXT_ONLY_TOOLS = [
   "mindvault_check_bindings",
