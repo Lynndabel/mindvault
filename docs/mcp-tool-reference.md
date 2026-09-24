@@ -15,7 +15,7 @@ For structured JSON results (`structuredContent` + `outputSchema`) see
 For client installation and configuration see
 [mcp-client-configs.md](mcp-client-configs.md).
 
-**37 tools** as of last generation.
+**38 tools** as of last generation.
 
 ---
 
@@ -102,10 +102,11 @@ For client installation and configuration see
 
 ## Other
 
-| Tool                              | Description                                                                                                                                                                 | Structured |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| `mindvault_recover_catalog_cache` | Attempt a catalog stale-cache recovery: requests the MCP to refresh or re-fetch catalog index data and provides recovery guidance. Useful when browse results appear stale. | yes        |
+| Tool                              | Description                                                                                                                                                                                                                                                                                                                | Structured |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `mindvault_recover_catalog_cache` | Attempt a catalog stale-cache recovery: requests the MCP to refresh or re-fetch catalog index data and provides recovery guidance. Useful when browse results appear stale.                                                                                                                                                | yes        |
+| `mindvault_subscribe_resource`    | Subscribe to a resource's price and status changes. Monitors price, verificationStatus, and listed state, emitting progress notifications when changes are detected. Pass wait: true to continuously poll for changes until timeoutMs elapses. Returns the final state and a list of all detected changes with timestamps. | yes        |
 
 ---
 
-_This file was generated from `mcp/src/tools.ts` — 37 tools._
+_This file was generated from `mcp/src/tools.ts` — 38 tools._

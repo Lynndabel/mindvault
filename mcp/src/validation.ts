@@ -193,6 +193,7 @@ const CATALOG_FILTER_ARGS: ToolArgumentSpec = {
 export const TOOLS_WITHOUT_ARG_VALIDATION: readonly string[] = [
   "mindvault_publish_status",
   "mindvault_purchase_history",
+  "mindvault_subscribe_resource",
 ];
 
 /**

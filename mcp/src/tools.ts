@@ -32,6 +32,7 @@ import {
   REGISTRY_INFO_OUTPUT_SCHEMA,
   REGISTRY_LIST_OUTPUT_SCHEMA,
   REGISTRY_LOOKUP_OUTPUT_SCHEMA,
+  RESOURCE_SUBSCRIPTION_OUTPUT_SCHEMA,
   TX_STATUS_OUTPUT_SCHEMA,
   USE_PROFILE_OUTPUT_SCHEMA,
   WALLET_INFO_OUTPUT_SCHEMA,
@@ -1079,6 +1080,47 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     outputSchema: PURCHASE_HISTORY_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Purchase History",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  {
+    name: "mindvault_subscribe_resource",
+    description:
+      "Subscribe to a resource's price and status changes. Monitors price, verificationStatus, and listed state, emitting progress notifications when changes are detected. Pass wait: true to continuously poll for changes until timeoutMs elapses. Returns the final state and a list of all detected changes with timestamps.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resourceId: {
+          type: "string",
+          description:
+            "The resource ID to monitor (from mindvault_browse, mindvault_search, or mindvault_preview). Example: 'cm7x8y9z'",
+          examples: ["cm7x8y9z", "res-001", "swcn98besxpp6t1u8e77fqz3"],
+        },
+        wait: {
+          type: "boolean",
+          description:
+            "When true, continuously poll for changes until timeoutMs elapses. Default false (single check).",
+        },
+        timeoutMs: {
+          type: "number",
+          description:
+            "Max monitoring time in milliseconds when wait is true (default 120000, max 600000).",
+          examples: [60000, 120000, 300000],
+        },
+        intervalMs: {
+          type: "number",
+          description:
+            "Delay between polls in milliseconds when wait is true (default 5000, min 1000).",
+          examples: [2000, 5000, 10000],
+        },
+      },
+      required: ["resourceId"],
+    },
+    outputSchema: RESOURCE_SUBSCRIPTION_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    annotations: {
+      title: "Subscribe to Resource",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,

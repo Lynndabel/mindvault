@@ -385,6 +385,47 @@ export const RECOVER_CACHE_OUTPUT_SCHEMA = {
   required: ["source", "action", "message"],
 } as const;
 
+const RESOURCE_CHANGE_SCHEMA = {
+  type: "object",
+  properties: {
+    field: { type: "string" },
+    oldValue: {},
+    newValue: {},
+    detectedAt: { type: "number" },
+  },
+  required: ["field", "oldValue", "newValue", "detectedAt"],
+} as const;
+
+export const RESOURCE_SUBSCRIPTION_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    resourceId: { type: "string" },
+    title: { type: ["string", "null"] },
+    price: { type: "string" },
+    verificationStatus: { type: "string" },
+    listed: { type: "boolean" },
+    changes: { type: "array", items: RESOURCE_CHANGE_SCHEMA },
+    polled: { type: "boolean" },
+    attempts: { type: "integer" },
+    settled: { type: "boolean" },
+    timedOut: { type: "boolean" },
+    message: { type: "string" },
+  },
+  required: [
+    "resourceId",
+    "title",
+    "price",
+    "verificationStatus",
+    "listed",
+    "changes",
+    "polled",
+    "attempts",
+    "settled",
+    "timedOut",
+    "message",
+  ],
+} as const;
+
 /** Tools that must stay text-only (no schema, no structuredContent). */
 export const TEXT_ONLY_TOOLS = [
   "mindvault_check_bindings",

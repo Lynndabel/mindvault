@@ -2476,6 +2476,133 @@ exports[`tool schema snapshots > mindvault_setup_wallet > output schema 1`] = `
 }
 `;
 
+exports[`tool schema snapshots > mindvault_subscribe_resource > annotations 1`] = `
+{
+  "destructiveHint": false,
+  "idempotentHint": true,
+  "readOnlyHint": true,
+  "title": "Subscribe to Resource",
+}
+`;
+
+exports[`tool schema snapshots > mindvault_subscribe_resource > input schema 1`] = `
+{
+  "properties": {
+    "intervalMs": {
+      "description": "Delay between polls in milliseconds when wait is true (default 5000, min 1000).",
+      "examples": [
+        2000,
+        5000,
+        10000,
+      ],
+      "type": "number",
+    },
+    "resourceId": {
+      "description": "The resource ID to monitor (from mindvault_browse, mindvault_search, or mindvault_preview). Example: 'cm7x8y9z'",
+      "examples": [
+        "cm7x8y9z",
+        "res-001",
+        "swcn98besxpp6t1u8e77fqz3",
+      ],
+      "type": "string",
+    },
+    "timeoutMs": {
+      "description": "Max monitoring time in milliseconds when wait is true (default 120000, max 600000).",
+      "examples": [
+        60000,
+        120000,
+        300000,
+      ],
+      "type": "number",
+    },
+    "wait": {
+      "description": "When true, continuously poll for changes until timeoutMs elapses. Default false (single check).",
+      "type": "boolean",
+    },
+  },
+  "required": [
+    "resourceId",
+  ],
+  "type": "object",
+}
+`;
+
+exports[`tool schema snapshots > mindvault_subscribe_resource > output schema 1`] = `
+{
+  "properties": {
+    "attempts": {
+      "type": "integer",
+    },
+    "changes": {
+      "items": {
+        "properties": {
+          "detectedAt": {
+            "type": "number",
+          },
+          "field": {
+            "type": "string",
+          },
+          "newValue": {},
+          "oldValue": {},
+        },
+        "required": [
+          "field",
+          "oldValue",
+          "newValue",
+          "detectedAt",
+        ],
+        "type": "object",
+      },
+      "type": "array",
+    },
+    "listed": {
+      "type": "boolean",
+    },
+    "message": {
+      "type": "string",
+    },
+    "polled": {
+      "type": "boolean",
+    },
+    "price": {
+      "type": "string",
+    },
+    "resourceId": {
+      "type": "string",
+    },
+    "settled": {
+      "type": "boolean",
+    },
+    "timedOut": {
+      "type": "boolean",
+    },
+    "title": {
+      "type": [
+        "string",
+        "null",
+      ],
+    },
+    "verificationStatus": {
+      "type": "string",
+    },
+  },
+  "required": [
+    "resourceId",
+    "title",
+    "price",
+    "verificationStatus",
+    "listed",
+    "changes",
+    "polled",
+    "attempts",
+    "settled",
+    "timedOut",
+    "message",
+  ],
+  "type": "object",
+}
+`;
+
 exports[`tool schema snapshots > mindvault_transfer_ownership > annotations 1`] = `
 {
   "destructiveHint": false,
@@ -3002,6 +3129,7 @@ exports[`tool schema snapshots > the covered tool names are pinned 1`] = `
   "mindvault_set_price",
   "mindvault_set_tags",
   "mindvault_setup_wallet",
+  "mindvault_subscribe_resource",
   "mindvault_transfer_ownership",
   "mindvault_tx_status",
   "mindvault_update_metadata",
