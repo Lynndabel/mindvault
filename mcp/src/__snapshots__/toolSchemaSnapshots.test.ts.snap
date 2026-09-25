@@ -1466,6 +1466,25 @@ exports[`tool schema snapshots > mindvault_list_profiles > output schema 1`] = `
 }
 `;
 
+exports[`tool schema snapshots > mindvault_mainnet_banner > annotations 1`] = `
+{
+  "destructiveHint": false,
+  "idempotentHint": true,
+  "readOnlyHint": true,
+  "title": "Mainnet Session Banner",
+}
+`;
+
+exports[`tool schema snapshots > mindvault_mainnet_banner > input schema 1`] = `
+{
+  "properties": {},
+  "required": [],
+  "type": "object",
+}
+`;
+
+exports[`tool schema snapshots > mindvault_mainnet_banner > output schema 1`] = `null`;
+
 exports[`tool schema snapshots > mindvault_metrics > annotations 1`] = `
 {
   "destructiveHint": false,
@@ -1643,6 +1662,25 @@ exports[`tool schema snapshots > mindvault_preview > output schema 1`] = `
   "type": "object",
 }
 `;
+
+exports[`tool schema snapshots > mindvault_prewarm_catalog > annotations 1`] = `
+{
+  "destructiveHint": false,
+  "idempotentHint": true,
+  "readOnlyHint": true,
+  "title": "Pre-warm Catalog Cache",
+}
+`;
+
+exports[`tool schema snapshots > mindvault_prewarm_catalog > input schema 1`] = `
+{
+  "properties": {},
+  "required": [],
+  "type": "object",
+}
+`;
+
+exports[`tool schema snapshots > mindvault_prewarm_catalog > output schema 1`] = `null`;
 
 exports[`tool schema snapshots > mindvault_publish > annotations 1`] = `
 {
@@ -4047,9 +4085,11 @@ exports[`tool schema snapshots > the covered tool names are pinned 1`] = `
   "mindvault_freeze",
   "mindvault_import_wallet",
   "mindvault_list_profiles",
+  "mindvault_mainnet_banner",
   "mindvault_metrics",
   "mindvault_network_profile",
   "mindvault_preview",
+  "mindvault_prewarm_catalog",
   "mindvault_publish",
   "mindvault_publish_batch",
   "mindvault_publish_status",
