@@ -28,8 +28,9 @@ const CATALOG_ITEM_SCHEMA = {
     price: { type: ["string", "number", "null"] },
     description: { type: ["string", "null"] },
     accessUrl: { type: ["string", "null"] },
+    tags: { type: "array", items: { type: "string" } },
   },
-  required: ["id", "title", "price", "description", "accessUrl"],
+  required: ["id", "title", "price", "description", "accessUrl", "tags"],
 } as const;
 
 export const CATALOG_LIST_OUTPUT_SCHEMA = {
@@ -241,6 +242,21 @@ export const REGISTRY_LIST_OUTPUT_SCHEMA = {
   required: ["source", "start", "limit", "count", "resources", "contract"],
 } as const;
 
+export const REGISTRY_COUNT_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    source: { type: "string" },
+    count: { type: "integer" },
+    listedCount: { type: "integer" },
+    creatorCount: { type: "integer" },
+    creator: { type: "string" },
+    contract: {},
+    network: {},
+    rpc: {},
+  },
+  required: ["source", "count", "listedCount", "contract"],
+} as const;
+
 export const REGISTRY_INFO_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -375,6 +391,25 @@ export const ONCHAIN_MUTATION_OUTPUT_SCHEMA = {
   oneOf: [ONCHAIN_MUTATION_SUCCESS, DRY_RUN_SCHEMA, TEXT_RESULT_SCHEMA],
 } as const;
 
+export const FEE_CONFIG_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    source: { type: "string" },
+    configured: { type: "boolean" },
+    platformFeeBps: { type: "integer" },
+    royaltyBps: { type: "integer" },
+    totalFeeBps: { type: "integer" },
+    creatorPayoutBps: { type: "integer" },
+    creatorPayoutPercent: { type: "string" },
+    feeRecipient: { type: ["string", "null"] },
+    message: { type: "string" },
+    contract: {},
+    network: {},
+    rpc: {},
+  },
+  required: ["source", "configured", "contract"],
+} as const;
+
 export const RECOVER_CACHE_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -385,79 +420,32 @@ export const RECOVER_CACHE_OUTPUT_SCHEMA = {
   required: ["source", "action", "message"],
 } as const;
 
-/**
- * One entry of a batch catalog lookup result (#608).
- *
- * `found` is false with `null` metadata for a resource the API does not know —
- * a miss is a result, not a failure, so one bad id cannot sink a batch.
- */
-const BATCH_CATALOG_ITEM_SCHEMA = {
+const BATCH_PUBLISH_ITEM_SCHEMA = {
   type: "object",
   properties: {
-    id: { type: "string" },
-    found: { type: "boolean" },
-    title: { type: ["string", "null"] },
-    price: { type: ["string", "number", "null"] },
-    verificationStatus: { type: ["string", "null"] },
-    resourceType: { type: ["string", "null"] },
-    accessUrl: { type: ["string", "null"] },
+    index: { type: "number" },
+    title: { type: "string" },
+    id: { type: ["string", "null"] },
+    verificationStatus: { type: "string", enum: ["approved", "rejected", "error"] },
+    onchainStatus: { type: ["string", "null"] },
+    flags: { type: "array", items: { type: "string" } },
+    error: { type: "string" },
   },
-  required: [
-    "id",
-    "found",
-    "title",
-    "price",
-    "verificationStatus",
-    "resourceType",
-    "accessUrl",
-  ],
+  required: ["index", "title", "id", "verificationStatus", "onchainStatus"],
 } as const;
 
-export const BATCH_CATALOG_LOOKUP_OUTPUT_SCHEMA = {
+export const PUBLISH_BATCH_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
-    items: { type: "array", items: BATCH_CATALOG_ITEM_SCHEMA },
-    requested: { type: "integer" },
-    foundCount: { type: "integer" },
-    missing: { type: "array", items: { type: "string" } },
-    notice: { type: ["string", "null"] },
-    truncated: { type: "boolean" },
+    requested: { type: "number" },
+    verified: { type: "number" },
+    rejected: { type: "number" },
+    errored: { type: "number" },
+    onchainStatus: { type: "string" },
+    txHash: { type: ["string", "null"] },
+    items: { type: "array", items: BATCH_PUBLISH_ITEM_SCHEMA },
   },
-  required: ["items", "requested", "foundCount", "missing", "notice", "truncated"],
-} as const;
-
-/**
- * Structured result for the metadata-hash preview tool (#604).
- *
- * `pointer` reports where the metadata pointer was read from, and `report`
- * mirrors `MetadataHashReport` (see metadataHash.ts): the canonical digest
- * when the pointer anchors one, or a deterministic reason when it does not.
- */
-export const METADATA_HASH_PREVIEW_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    resourceId: { type: "string" },
-    pointer: {
-      type: "object",
-      properties: {
-        source: { type: ["string", "null"] },
-        present: { type: "boolean" },
-      },
-      required: ["source", "present"],
-    },
-    report: {
-      type: "object",
-      properties: {
-        present: { type: "boolean" },
-        valid: { type: "boolean" },
-        canonical: { type: ["string", "null"] },
-        algorithm: { type: ["string", "null"] },
-        reason: { type: ["string", "null"] },
-      },
-      required: ["present", "valid", "canonical", "algorithm", "reason"],
-    },
-  },
-  required: ["resourceId", "pointer", "report"],
+  required: ["requested", "verified", "rejected", "errored", "onchainStatus", "txHash", "items"],
 } as const;
 
 /** Tools that must stay text-only (no schema, no structuredContent). */
@@ -472,4 +460,10 @@ export const TEXT_ONLY_TOOLS = [
   "mindvault_register",
   "mindvault_rotate_publisher_key",
   "mindvault_set_tags",
+  "mindvault_prewarm_catalog",
+  "mindvault_client_config",
+  "mindvault_mainnet_banner",
+  "mindvault_switch_network_profile",
+  "mindvault_resource_provenance",
+  "mindvault_resource_change_log",
 ] as const;

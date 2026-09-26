@@ -31,6 +31,7 @@ import { parseMetadataHash, MetadataHashError, METADATA_HASH_FORMAT_HINT } from 
 import { CATALOG_MAX_LIMIT, CATALOG_SORT_VALUES } from "./catalogFilters.js";
 import { REGISTRY_LIST_MAX_LIMIT } from "./registryPagination.js";
 import { RECEIPT_EXPORT_MAX_LIMIT } from "./receipts.js";
+import { DEBUG_BUNDLE_MAX_AUDIT_LINES } from "./debugBundleSchema.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 
 // ── Spec model ────────────────────────────────────────────────────────────────
@@ -215,6 +216,10 @@ const CATALOG_FILTER_ARGS: ToolArgumentSpec = {
 export const TOOLS_WITHOUT_ARG_VALIDATION: readonly string[] = [
   "mindvault_publish_status",
   "mindvault_purchase_history",
+  // items is an array of objects — the generic validator handles only flat
+  // string/flag/hash/integer/enum/tag_array fields. Argument shape is enforced
+  // by the input schema in tools.ts and validated inline in the dispatch handler.
+  "mindvault_publish_batch",
 ];
 
 /**
@@ -225,6 +230,10 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
   mindvault_setup_wallet: { profile: PROFILE_NAME, confirmMainnet: CONFIRM_MAINNET },
   mindvault_wallet_info: {},
   mindvault_use_profile: { name: { ...PROFILE_NAME, required: true } },
+  mindvault_switch_network_profile: {
+    name: { ...PROFILE_NAME, required: true },
+    network: { kind: "enum", values: ["testnet", "mainnet"], required: true },
+  },
   mindvault_list_profiles: {},
   mindvault_browse: { ...CATALOG_FILTER_ARGS },
   mindvault_search: { ...CATALOG_FILTER_ARGS },
@@ -269,7 +278,7 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
     confirmPaid: CONFIRM_PAID,
   },
   mindvault_export_receipts: {
-    format: { kind: "enum", values: ["json", "csv"] },
+    format: { kind: "enum", values: ["json", "csv", "ndjson"] },
     resourceId: { ...RESOURCE_ID, required: false },
     network: { kind: "string", maxLength: 64 },
     since: { kind: "string", maxLength: 64 },
@@ -294,20 +303,9 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
     start: { kind: "integer", min: 0 },
     limit: { kind: "integer", min: 1, max: REGISTRY_LIST_MAX_LIMIT },
   },
-  mindvault_batch_catalog_lookup: {
-    // `pattern` constrains each entry: ids are interpolated into API paths,
-    // so an entry must satisfy the same shape single-id tools enforce.
-    resourceIds: {
-      kind: "string_array",
-      required: true,
-      minLength: 1,
-      maxLength: BATCH_LOOKUP_MAX_IDS,
-      pattern: /^[A-Za-z0-9._-]+$/,
-      patternHint: "a resource id: letters, digits, dot, dash, or underscore (max 128 chars)",
-    },
-    refetch: { kind: "flag" },
+  mindvault_registry_count: {
+    creator: { kind: "string" },
   },
-  mindvault_preview_metadata_hash: { resourceId: RESOURCE_ID },
   mindvault_tx_status: { txHash: { kind: "hash", required: true, bareHex: true } },
   // `confirm` is what resetGuard.isResetConfirmed reads. It was advertised in
   // ListTools and absent here, so every confirmed reset failed validation as an
@@ -317,12 +315,18 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
     all: { kind: "flag" },
     confirmMainnet: CONFIRM_MAINNET,
   },
-  mindvault_backup_state: { passphrase: PASSPHRASE },
+  mindvault_backup_state: { passphrase: PASSPHRASE, confirm: { kind: "flag" } },
+  mindvault_resource_provenance: { resourceId: RESOURCE_ID },
+  mindvault_resource_change_log: { resourceId: RESOURCE_ID },
   mindvault_restore_state: {
     blob: { kind: "string", required: true, maxLength: 1_048_576 },
     passphrase: PASSPHRASE,
   },
   mindvault_metrics: { reset: { kind: "flag" } },
+  mindvault_debug_bundle: {
+    auditLogLines: { kind: "integer", min: 0, max: DEBUG_BUNDLE_MAX_AUDIT_LINES },
+    includeEnvironment: { kind: "flag" },
+  },
   mindvault_set_tags: {
     resourceId: RESOURCE_ID,
     tags: { kind: "tag_array", required: true },
@@ -352,8 +356,35 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
     confirmMainnet: CONFIRM_MAINNET,
     confirmPaid: CONFIRM_PAID,
   },
+  mindvault_freeze: {
+    resourceId: RESOURCE_ID,
+    confirm: {
+      kind: "string",
+      required: true,
+      pattern: /^freeze_metadata$/,
+      patternHint: 'the exact string "freeze_metadata"',
+    },
+    confirmMainnet: CONFIRM_MAINNET,
+    confirmPaid: CONFIRM_PAID,
+  },
+  mindvault_fee_config: {},
+  mindvault_royalty: {
+    resourceId: RESOURCE_ID,
+    royaltyRecipient: STELLAR_ADDRESS,
+    clear: { kind: "flag" },
+    confirmMainnet: CONFIRM_MAINNET,
+    confirmPaid: CONFIRM_PAID,
+  },
   mindvault_check_state_permissions: {},
   mindvault_registry_health: {},
+  mindvault_prewarm_catalog: {},
+  mindvault_client_config: {
+    client: {
+      kind: "enum",
+      values: ["claude-code", "claude-desktop", "codex", "cursor", "vscode", "windsurf"],
+    },
+  },
+  mindvault_mainnet_banner: {},
   mindvault_import_wallet: {
     secretKey: {
       kind: "string",

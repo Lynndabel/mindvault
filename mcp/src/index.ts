@@ -29,6 +29,7 @@ import { applyPreviewLimits, serializePreview } from "./previewLimits.js";
 import { createEd25519Signer } from "@x402/stellar";
 import { ExactStellarScheme } from "@x402/stellar/exact/client";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
+import { Client as DynamicContractClient } from "@stellar/stellar-sdk/contract";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -36,10 +37,14 @@ import { cacheStalenessNotice } from "./cacheStaleness.js";
 import { buildConfig, resolveConfig } from "./config.js";
 import {
   assertMainnetMutationAllowed,
+  formatMainnetBanner,
   formatMainnetDiagnostics,
   mainnetAllowedFromEnv,
 } from "./mainnetGuardrails.js";
-import { assertPaidOperationConfirmed } from "./paidOperations.js";
+import {
+  assertPaidOperationConfirmed,
+  formatPaidConfirmationDiagnostics,
+} from "./paidOperations.js";
 import { assertToolAllowedInReadOnlyMode } from "./readOnlyMode.js";
 import {
   createMetricsRecorder,
@@ -50,16 +55,20 @@ import {
 import {
   createMockFetch,
   mockEnabledFromEnv,
+  mockRegistryCount,
   mockRegistryLookup,
   mockRegistryList,
   mockUpdateMetadata,
   mockSetPrice,
   mockTransferOwnership,
   mockSetListed,
+  mockSetTags,
 } from "./mock.js";
 import { purchaseHistoryTool, recordPurchase } from "./purchaseHistory.js";
 import { Mutex } from "./mutex.js";
 import { exportReceiptsTool } from "./receipts.js";
+import { debugBundleTool } from "./debugBundle.js";
+import { exportReceiptsToolWithTimeout } from "./receipts.js";
 import { normalizeToolResult, outcomeText, type ToolOutcome } from "./toolResult.js";
 import { advertisedTools, hasOutputSchema } from "./toolSurface.js";
 import { dryRunPublish, dryRunBuy } from "./dryRun.js";
@@ -70,6 +79,7 @@ import {
   optionalInt,
   optionalString,
   requiredString,
+  requiredTagArray,
   TOOL_ARGUMENT_SPECS,
   TOOLS_WITHOUT_ARG_VALIDATION,
   UnknownToolError,
@@ -97,16 +107,24 @@ import {
 } from "./publishStatus.js";
 import { type ApiResponse } from "./apiResponse.js";
 import { safeErrorMessage, safeLog } from "./redaction.js";
-import { assertAutoPaymentWithinCeiling } from "./paymentCeiling.js";
+import { assertAutoPaymentWithinCeiling, assertTransactionFeeWithinCeiling } from "./paymentCeiling.js";
+import {
+  compareUsdc,
+  normalizeUsdcBalance,
+  stroopsToUsdc,
+  trimUsdc,
+  usdcToStroops as toStroops,
+} from "./usdcAmount.js";
 import { signMutatingHeaders } from "./requestSignature.js";
 import {
-  exportState,
+  exportStateFile,
   restoreState,
   checkStatePermissions,
   preserveLegacyState,
   quarantineStateFile,
   writeAtomically,
 } from "./stateBackup.js";
+import { provenanceChain, recordResourceHistory, resourceChangeLog } from "./resourceHistory.js";
 import { formatResetPreview, isResetConfirmed, type ResetScope } from "./resetGuard.js";
 import { verifyInstall, formatVerifyInstall } from "./verifyInstall.js";
 import {
@@ -117,6 +135,7 @@ import {
   withTimeout,
   type TimeoutService,
 } from "./httpTimeout.js";
+import { resolveToolTimeouts, timeoutForTool } from "./toolTimeoutOverrides.js";
 import {
   describeRetryPolicy,
   formatRetryLog,
@@ -142,9 +161,16 @@ import {
 import {
   mapSponsoredHttpFailure,
   mapSponsoredTransportFailure,
+  sanitizeServiceUrl,
   SPONSORED_CREATE_PATH,
 } from "./sponsoredDiagnostics.js";
 import { describeMetadataPointerHash, parseMetadataHash } from "./metadataHash.js";
+import {
+  checkWalletIntegrity,
+  sponsoredWalletIntegrityError,
+  unownedWalletNote,
+  type DerivePublicKey,
+} from "./sponsoredWallet.js";
 import {
   applyCatalogSort,
   applyClientCatalogFilters,
@@ -155,11 +181,13 @@ import {
 } from "./catalogFilters.js";
 import {
   catalogCacheLabel,
+  type CatalogFallbackReason,
   getCatalogSnapshot,
   getPreviewSnapshot,
   recordCatalogSnapshot,
   recordPreviewSnapshot,
 } from "./catalogCache.js";
+import { publishBatch, type BatchPublishItem } from "./tools/publish.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -167,17 +195,28 @@ import {
 // unit-tested function so the config path no longer runs as an untestable
 // top-level side effect. The named aliases below keep the rest of this file
 // unchanged.
-const {
-  stellarNetwork: STELLAR_NETWORK,
-  networkPreset,
-  x402Network: NETWORK,
-  baseUrl: BASE_URL,
-  registryContractId: REGISTRY_CONTRACT_ID,
-  registryNetworkPassphrase: REGISTRY_NETWORK_PASSPHRASE,
-  sponsoredAccountUrl: SPONSORED_ACCOUNT_URL,
-  horizonUrl: HORIZON_URL,
-  sorobanRpcUrl: SOROBAN_RPC_URL,
-} = buildConfig(process.env);
+const initialConfig = buildConfig(process.env);
+let STELLAR_NETWORK = initialConfig.stellarNetwork;
+let networkPreset = initialConfig.networkPreset;
+let NETWORK = initialConfig.x402Network;
+const BASE_URL = initialConfig.baseUrl;
+let REGISTRY_CONTRACT_ID = initialConfig.registryContractId;
+let REGISTRY_NETWORK_PASSPHRASE = initialConfig.registryNetworkPassphrase;
+const SPONSORED_ACCOUNT_URL = initialConfig.sponsoredAccountUrl;
+let HORIZON_URL = initialConfig.horizonUrl;
+let SOROBAN_RPC_URL = initialConfig.sorobanRpcUrl;
+
+function applyNetworkConfig(network: "testnet" | "mainnet"): void {
+  process.env.STELLAR_NETWORK = network;
+  const next = buildConfig(process.env);
+  STELLAR_NETWORK = next.stellarNetwork;
+  networkPreset = next.networkPreset;
+  NETWORK = next.x402Network;
+  REGISTRY_CONTRACT_ID = next.registryContractId;
+  REGISTRY_NETWORK_PASSPHRASE = next.registryNetworkPassphrase;
+  HORIZON_URL = next.horizonUrl;
+  SOROBAN_RPC_URL = next.sorobanRpcUrl;
+}
 
 // Startup diagnostics: collect every configuration problem in one pass so the
 // operator sees the full list (with exact variable names and expected values)
@@ -211,6 +250,7 @@ const httpFetch: typeof fetch = MOCK
   : (input, init) => fetch(input as RequestInfo | URL, init);
 
 const TIMEOUTS = resolveTimeouts(process.env);
+const TOOL_TIMEOUTS = resolveToolTimeouts(process.env).overrides;
 
 const RETRY_POLICY = retryPolicyFromEnv(process.env);
 
@@ -218,7 +258,7 @@ const USER_AGENT = resolveUserAgent(process.env);
 
 const logRetry = process.env.VITEST
   ? undefined
-  : (info: RetryAttemptInfo) => console.error(`MindVault MCP: ${formatRetryLog(info)}`);
+  : (info: RetryAttemptInfo) => logger.info(`MindVault MCP: ${formatRetryLog(info)}`);
 
 function httpRetryOptions(label: string) {
   return {
@@ -255,6 +295,10 @@ function activeProfile(): WalletProfile {
   return (profiles[activeProfileName] ??= {});
 }
 
+function bindActiveProfileToNetwork(): void {
+  activeProfile().network ??= NETWORK;
+}
+
 function currentWallet(): AgentWallet | null {
   return profiles[activeProfileName]?.wallet ?? null;
 }
@@ -264,7 +308,10 @@ function currentApiKey(): string | null {
 }
 
 export function _setAgentWallet(w: AgentWallet | null): void {
-  if (w) activeProfile().wallet = w;
+  if (w) {
+    activeProfile().wallet = w;
+    bindActiveProfileToNetwork();
+  }
   else delete activeProfile().wallet;
 }
 export function _setAgentApiKey(k: string | null): void {
@@ -282,19 +329,27 @@ function applyRestoredState(state: ProfileState): void {
   saveState();
 }
 
-export function backupState(passphrase: string): string {
-  const blob = exportState(passphrase);
+export function backupState(passphrase: string, confirm: unknown = false): string {
+  if (!isResetConfirmed(confirm)) {
+    return [
+      "Backup NOT performed — confirmation required.",
+      "This will export every wallet secret key and publisher API key in encrypted form.",
+      "To proceed, call mindvault_backup_state again with confirm: true.",
+    ].join("\n");
+  }
+  const path = exportStateFile(passphrase);
   return [
-    "Encrypted state backup ready. Copy the blob below to the new environment.",
-    "Restore with mindvault_restore_state using the same passphrase.",
-    "The blob does not contain plaintext secrets.",
-    "",
-    blob,
+    "Encrypted state backup written.",
+    `File: ${path}`,
+    "The file is mode 0600 and contains no plaintext secrets.",
+    "Restore with mindvault_restore_state using the file contents as blob and the same passphrase.",
   ].join("\n");
 }
 
 export function restoreStateTool(blob: string, passphrase: string): string {
-  return restoreState(blob, passphrase, applyRestoredState);
+  return restoreState(blob, passphrase, applyRestoredState, {
+    expectedNetwork: NETWORK,
+  });
 }
 
 function quarantineCorruptState(reason: string, detail: string): void {
@@ -361,7 +416,15 @@ function persistableProfiles(): Record<string, WalletProfile> {
   return out;
 }
 
-function saveState(): void {
+/**
+ * Persist the profile state, reporting whether the write landed.
+ *
+ * A failed write stays non-fatal — losing the state file must not take the
+ * server down mid-session — but callers that just told the agent its wallet is
+ * safe on disk need to know when it is not (#839). Callers that do not care can
+ * keep ignoring the result.
+ */
+function saveState(): boolean {
   try {
     const state: ProfileState = {
       version: STATE_VERSION,
@@ -369,8 +432,10 @@ function saveState(): void {
       profiles: persistableProfiles(),
     };
     writeAtomically(STATE_FILE, JSON.stringify(state, null, 2), 0o600);
+    return true;
   } catch (err) {
     console.error("MindVault MCP: failed to persist state:", safeErrorMessage(err));
+    return false;
   }
 }
 
@@ -504,6 +569,44 @@ async function registryHealth(): Promise<string> {
   return lines.join("\n");
 }
 
+// ── #882: Catalog cache pre-warm ─────────────────────────────────────────────
+// browseOutcome() already records a fresh snapshot into catalogCache.ts on
+// every successful call and falls back to the last snapshot on a transport
+// failure — but on a genuine cold boot there is no snapshot yet, so the very
+// first failure has nothing to fall back to. This proactively triggers one
+// browse at MCP startup (and on demand via mindvault_prewarm_catalog) so that
+// if the API is unreachable early in a session, the fallback it serves is a
+// fresh one rather than none at all.
+export async function prewarmCatalogCache(): Promise<string> {
+  const startedAt = Date.now();
+  try {
+    await browseOutcome({});
+    const elapsedMs = Date.now() - startedAt;
+    const snapshot = getCatalogSnapshot();
+    const count = snapshot && Array.isArray(snapshot.resources) ? snapshot.resources.length : 0;
+    return `Catalog pre-warmed: ${count} resource(s) cached in ${elapsedMs}ms.`;
+  } catch (err) {
+    return `Catalog pre-warm failed: ${safeErrorMessage(err)}`;
+  }
+}
+
+// ── #878: Mainnet session banner ─────────────────────────────────────────────
+// formatMainnetDiagnostics/formatPaidConfirmationDiagnostics are compact
+// one-liners meant for repeated diagnostic output. This is the fuller,
+// session-level version: a plain-language explanation of the active network
+// and the paid-operation confirmation policy together, meant to be read once
+// when an agent session starts, before it attempts any paid or destructive
+// operation.
+export function mainnetBanner(): string {
+  const banner = formatMainnetBanner({
+    stellarNetwork: STELLAR_NETWORK,
+    x402Network: NETWORK,
+    registryContractId: REGISTRY_CONTRACT_ID,
+    allowMainnetEnv: mainnetAllowedFromEnv(),
+  });
+  return [banner, "", formatPaidConfirmationDiagnostics()].join("\n");
+}
+
 const API_MUTATION_TOOLS = new Set([
   "mindvault_register",
   "mindvault_publish",
@@ -556,6 +659,7 @@ async function importWallet(args: {
   if (persist) {
     activeProfileName = target;
     activeProfile().wallet = { publicKey, secretKey };
+    bindActiveProfileToNetwork();
     saveState();
     return {
       text: [
@@ -712,6 +816,44 @@ function requireWallet(): AgentWallet {
   return wallet;
 }
 
+/**
+ * Normalize a metadata pointer string before writing it to the vault registry.
+ *
+ * HTTP(S) URL pointers are normalized the same way `hashLinkResource` on the
+ * server normalizes external URLs at publish time (see
+ * `server/src/utils/crypto.ts`):
+ *
+ *   - Lowercase scheme + host
+ *   - Strip trailing slash from pathname (unless the pathname is exactly "/")
+ *   - Sort query parameters alphabetically
+ *
+ * This ensures a pointer like `https://example.com/metadata.json/` produced by
+ * an update call is identical on-chain to the `https://example.com/metadata.json`
+ * form used at publish, so content-hash comparisons across the two operations
+ * remain consistent.
+ *
+ * Non-HTTP(S) schemes (ipfs://, ar://, sha256:, 0x…) are passed through
+ * unchanged — their syntax is scheme-specific and we must not mutate them.
+ */
+export function normalizeMetadataPointer(pointer: string): string {
+  const trimmed = pointer.trim();
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  try {
+    const u = new URL(trimmed);
+    u.hostname = u.hostname.toLowerCase();
+    u.pathname = u.pathname.replace(/\/+$/, "") || "/";
+    const sorted = Array.from(u.searchParams.entries()).sort(([a], [b]) => a.localeCompare(b));
+    u.search = "";
+    sorted.forEach(([k, v]) => u.searchParams.append(k, v));
+    return u.toString();
+  } catch {
+    // Malformed URL — return as-is and let the contract validation reject it.
+    return trimmed;
+  }
+}
+
 function publisherCredential(profile: string = activeProfileName): CredentialContext {
   return { kind: "publisher_api_key", profile };
 }
@@ -813,10 +955,26 @@ async function getBalanceDetails(publicKey: string): Promise<BalanceDetails> {
     };
   }
 
+  // Horizon sends a decimal string; the balance is tagged with that encoding
+  // and normalized once, so the number this status is decided from can never be
+  // a stroop count read as decimal USDC (#838).
   const usdc = usdcBalance.balance ?? "0";
-  const usdcFloat = parseFloat(usdc);
+  const normalized = normalizeUsdcBalance({ source: "horizon", balance: usdc });
 
-  if (usdcFloat === 0) {
+  if (normalized === null) {
+    return {
+      status: "zero",
+      xlmBalance: xlm,
+      xlmReserve: reserve.toFixed(1),
+      xlmAvailable: available.toFixed(7),
+      usdcBalance: "0",
+      message:
+        `Horizon reported a USDC balance this server could not read ("${String(usdc).slice(0, 32)}"), ` +
+        `so it is treated as zero rather than guessed at. Re-run mindvault_wallet_info; if it persists, the Horizon endpoint is returning an unexpected balance format.`,
+    };
+  }
+
+  if (toStroops(normalized) === 0n) {
     return {
       status: "zero",
       xlmBalance: xlm,
@@ -868,6 +1026,10 @@ async function getAccountBalances(
 }
 
 function formatResource(r: any): string {
+  const tags = Array.isArray(r.tags) && r.tags.length > 0 ? `\n  Tags: ${r.tags.join(", ")}` : "";
+  if (tags) {
+    return `[${r.id}] ${r.title} - $${r.price} USDC\n  ${r.description ?? ""}${tags}\n  ${r.accessUrl}`;
+  }
   return `[${r.id}] ${r.title} — $${r.price} USDC\n  ${r.description ?? ""}\n  ${r.accessUrl}`;
 }
 
@@ -877,6 +1039,7 @@ function catalogItemStructured(r: any): {
   price: string | number | null;
   description: string | null;
   accessUrl: string | null;
+  tags: string[];
 } {
   return {
     id: r?.id ?? null,
@@ -884,6 +1047,7 @@ function catalogItemStructured(r: any): {
     price: r?.price ?? null,
     description: r?.description ?? null,
     accessUrl: r?.accessUrl ?? null,
+    tags: Array.isArray(r?.tags) ? r.tags.filter((tag: unknown) => typeof tag === "string") : [],
   };
 }
 
@@ -910,14 +1074,28 @@ async function insufficientFundsMessage(
   const need = typeof amountNeeded === "number" ? amountNeeded : parseFloat(amountNeeded);
   if (!Number.isFinite(need)) return null;
   const balance = await getUsdcBalance(wallet.publicKey);
-  const have = parseFloat(balance);
-  if (!Number.isFinite(have) || have >= need) return null;
-  const shortfall = need - have;
+
+  // Compared in stroops rather than floats, so the decision to spend never
+  // depends on binary rounding, and an amount that cannot be parsed blocks the
+  // payment instead of reading as "enough" (#838).
+  const needAmount = need.toFixed(7);
+  const comparison = compareUsdc(balance, needAmount);
+  if (comparison === null) {
+    return [
+      `Cannot confirm the USDC balance before paying to ${action}.`,
+      `Amount needed: ${trimUsdc(needAmount)} USDC`,
+      `Reported balance: "${String(balance).slice(0, 32)}" could not be read as a USDC amount.`,
+      `No payment was submitted. Check the wallet with mindvault_wallet_info and retry.`,
+    ].join("\n");
+  }
+  if (comparison >= 0) return null;
+
+  const shortfallStroops = (toStroops(needAmount) ?? 0n) - (toStroops(balance) ?? 0n);
   return [
     `Insufficient USDC to ${action}.`,
-    `Amount needed: ${need} USDC`,
-    `Current balance: ${have} USDC`,
-    `Shortfall: ${shortfall.toFixed(7).replace(/\.?0+$/, "")} USDC`,
+    `Amount needed: ${trimUsdc(needAmount)} USDC`,
+    `Current balance: ${trimUsdc(balance)} USDC`,
+    `Shortfall: ${trimUsdc(stroopsToUsdc(shortfallStroops))} USDC`,
     `Fund ${wallet.publicKey} with the shortfall and retry.`,
   ].join("\n");
 }
@@ -1005,6 +1183,17 @@ function sponsoredAccountErrorData(status: number, data: unknown): unknown {
   return data;
 }
 
+/**
+ * Stellar key derivation for the wallet integrity checks, loaded on demand.
+ *
+ * The SDK import is deferred — as `mindvault_import_wallet` already does — so
+ * the full Stellar SDK stays off the server's startup path.
+ */
+async function stellarDerivePublicKey(): Promise<DerivePublicKey> {
+  const { Keypair } = await import("@stellar/stellar-sdk");
+  return (secretKey: string) => Keypair.fromSecret(secretKey).publicKey();
+}
+
 async function setupWallet(profileArg?: string): Promise<ToolOutcome> {
   const target = resolveProfileName(profileArg);
   const operation = "mindvault_setup_wallet failed to create wallet";
@@ -1031,18 +1220,30 @@ async function setupWallet(profileArg?: string): Promise<ToolOutcome> {
       }),
     );
   }
+  // A 200 is not proof the service completed: a half-finished creation can
+  // answer with an address whose secret is missing or belongs to a different
+  // account. Persisting that gives the agent a funded address it cannot sign
+  // for, which every later tool then reports as a healthy wallet (#839).
+  const integrity = checkWalletIntegrity(res.data ?? {}, await stellarDerivePublicKey());
+  if (!integrity.ok) {
+    throw sponsoredWalletIntegrityError(integrity, sanitizeServiceUrl(SPONSORED_ACCOUNT_URL));
+  }
+
   activeProfileName = target;
-  activeProfile().wallet = { publicKey: res.data.publicKey, secretKey: res.data.secretKey };
-  saveState();
+  activeProfile().wallet = { publicKey: integrity.publicKey, secretKey: integrity.secretKey };
+  const persisted = saveState();
   const text = [
     `Wallet created.`,
     `Profile: ${target}`,
-    `Address: ${res.data.publicKey}`,
-    `Wallet persisted to ${STATE_FILE} (mode 0600).`,
+    `Address: ${integrity.publicKey}`,
+    persisted
+      ? `Wallet persisted to ${STATE_FILE} (mode 0600).`
+      : `⚠ Wallet held in memory only — writing ${STATE_FILE} failed, so it is lost when this server stops. ` +
+        `Back it up now with mindvault_backup_state, then fix the state directory's permissions.`,
   ].join("\n");
   return {
     text,
-    structured: { profile: target, address: res.data.publicKey, persisted: true },
+    structured: { profile: target, address: integrity.publicKey, persisted },
   };
 }
 
@@ -1050,6 +1251,13 @@ async function walletInfoOutcome(): Promise<ToolOutcome> {
   const wallet = requireWallet();
   const details = await getBalanceDetails(wallet.publicKey);
   const publisherRegistered = !!currentApiKey();
+
+  // A stored keypair can name an address this agent cannot sign for — a
+  // half-completed sponsored creation, a hand-edited state file, a restored
+  // backup from another profile. The balance below is real either way, so say
+  // plainly when it is not spendable rather than letting it read as funds (#839).
+  const integrity = checkWalletIntegrity(wallet, await stellarDerivePublicKey());
+  const ownsAddress = integrity.ok;
 
   const lines = [
     `Profile: ${activeProfileName}`,
@@ -1061,6 +1269,10 @@ async function walletInfoOutcome(): Promise<ToolOutcome> {
     `USDC Status: ${details.status}`,
     `Publisher registered: ${publisherRegistered ? "yes" : "no"}`,
   ];
+
+  if (!ownsAddress) {
+    lines.push(`⚠ Keystore: ${unownedWalletNote(integrity)}`);
+  }
 
   if (details.message) {
     lines.push(`Note: ${details.message}`);
@@ -1077,6 +1289,8 @@ async function walletInfoOutcome(): Promise<ToolOutcome> {
       usdcBalance: details.usdcBalance,
       usdcStatus: details.status,
       publisherRegistered,
+      /** False when the stored secret does not derive this address (#839). */
+      ownsAddress,
       note: details.message ?? null,
     },
   };
@@ -1120,6 +1334,20 @@ export function useProfile(nameArg: string): string {
   return outcomeText(useProfileOutcome(nameArg));
 }
 
+export function switchNetworkProfile(name: string, network: "testnet" | "mainnet"): string {
+  if (!isValidProfileName(name)) throw new Error("Invalid profile name.");
+  activeProfileName = name;
+  activeProfile().network = network;
+  applyNetworkConfig(network);
+  saveState();
+  const verification = verifyInstall({ ...process.env, STELLAR_NETWORK: network });
+  return JSON.stringify(
+    { profile: name, network, verification: { ok: verification.ok, checks: verification.checks } },
+    null,
+    2,
+  );
+}
+
 /** List every named profile, marking the active one. Secrets are never shown. */
 function listProfilesOutcome(): ToolOutcome {
   const names = Object.keys(profiles).sort();
@@ -1152,6 +1380,45 @@ export function listProfiles(): string {
   return outcomeText(listProfilesOutcome());
 }
 
+/**
+ * Whether a failed catalog read should fall back to the offline snapshot (#837).
+ *
+ * The cache exists for one situation: the catalog could not answer. A transport
+ * failure is that situation, and so is a transient server or throttling status
+ * once the retry layer has exhausted its attempts — `jsonFetch` already replays
+ * idempotent GETs on 408/425/429/5xx, so reaching this point means the gateway
+ * stayed broken.
+ *
+ * Everything else is the service answering, and answering about *this request*:
+ * a 400 on a malformed filter, a 404, a 401. Serving a snapshot for those hides
+ * a fixable client error behind stale data labelled "API unreachable", and the
+ * agent repeats the bad request against a cache that will never reflect it. So
+ * those propagate.
+ */
+function catalogFallbackFor(err: unknown): CatalogFallbackReason | null {
+  const mapped = mappedErrorOf(err);
+  if (!mapped) return { kind: "unreachable" };
+  if (mapped.status === undefined) {
+    // Transport-level: classified as network or timeout, never a status.
+    return mapped.category === "network" || mapped.category === "timeout"
+      ? { kind: "unreachable" }
+      : null;
+  }
+  return isRetryableStatus(mapped.status) ? { kind: "status", status: mapped.status } : null;
+}
+
+/** Resolve a failed catalog read to a snapshot, or rethrow when it must surface. */
+function catalogSnapshotFor(err: unknown): { resources: unknown[]; notice: string } | null {
+  const reason = catalogFallbackFor(err);
+  if (!reason) return null;
+  const snapshot = getCatalogSnapshot();
+  if (!snapshot) return null;
+  return {
+    resources: snapshot.resources,
+    notice: catalogCacheLabel(snapshot.savedAtMs, Date.now(), reason),
+  };
+}
+
 async function browseOutcome(filters: CatalogFilters = {}): Promise<ToolOutcome> {
   const qs = buildCatalogQueryString(filters);
   const url = qs ? `${BASE_URL}/resources?${qs}` : `${BASE_URL}/resources`;
@@ -1173,10 +1440,10 @@ async function browseOutcome(filters: CatalogFilters = {}): Promise<ToolOutcome>
     recordCatalogSnapshot(raw);
     notice = cacheStalenessNotice(res.headers);
   } catch (err) {
-    const snapshot = getCatalogSnapshot();
-    if (!snapshot) throw err;
-    raw = Array.isArray(snapshot.resources) ? (snapshot.resources as any[]) : [];
-    notice = catalogCacheLabel(snapshot.savedAtMs);
+    const fallback = catalogSnapshotFor(err);
+    if (!fallback) throw err;
+    raw = Array.isArray(fallback.resources) ? (fallback.resources as any[]) : [];
+    notice = fallback.notice;
   }
   const items: any[] = applyCatalogSort(applyClientCatalogFilters(raw, filters), filters.sort);
   const body =
@@ -1240,10 +1507,10 @@ async function searchOutcome(filtersOrQuery: string | CatalogFilters): Promise<T
     recordCatalogSnapshot(raw);
     notice = cacheStalenessNotice(res.headers);
   } catch (err) {
-    const snapshot = getCatalogSnapshot();
-    if (!snapshot) throw err;
-    raw = Array.isArray(snapshot.resources) ? (snapshot.resources as any[]) : [];
-    notice = catalogCacheLabel(snapshot.savedAtMs);
+    const fallback = catalogSnapshotFor(err);
+    if (!fallback) throw err;
+    raw = Array.isArray(fallback.resources) ? (fallback.resources as any[]) : [];
+    notice = fallback.notice;
   }
 
   // Client-side keyword / tags / listed / skipped for unit-test compatibility
@@ -1279,10 +1546,12 @@ async function previewData(resourceId: string): Promise<{ r: any; label: string 
     recordPreviewSnapshot(resourceId, res.data);
     return { r: res.data, label: null };
   } catch (err) {
-    const snap = getPreviewSnapshot(resourceId);
-    // No cached snapshot for this resource — surface the original error.
-    if (!snap) throw err;
-    return { r: snap.meta as any, label: catalogCacheLabel(snap.savedAtMs) };
+    // Same rule as browse/search: a snapshot answers for a catalog that could
+    // not answer, never for a 404 on an id the agent got wrong (#837).
+    const reason = catalogFallbackFor(err);
+    const snap = reason ? getPreviewSnapshot(resourceId) : null;
+    if (!snap || !reason) throw err;
+    return { r: snap.meta as any, label: catalogCacheLabel(snap.savedAtMs, Date.now(), reason) };
   }
 }
 
@@ -1537,6 +1806,15 @@ async function publish(args: {
     failureGuidance: failureGuidance.length > 0 ? failureGuidance : null,
   };
 
+  recordResourceHistory({
+    resourceId: resource.id,
+    kind: "created",
+    actor: currentWallet()?.publicKey,
+    value: resource.price,
+    txHash: onchainTxHash,
+    network: NETWORK,
+  });
+
   return JSON.stringify(summary, null, 2);
 }
 
@@ -1623,8 +1901,17 @@ export async function buy(
       receiptRef: receipt?.paymentId != null ? String(receipt.paymentId) : null,
       ...(title ? { title } : {}),
     });
+    recordResourceHistory({
+      resourceId,
+      kind: "purchased",
+      actor: wallet.publicKey,
+      recipient: receipt?.paidTo != null ? String(receipt.paidTo) : undefined,
+      amount,
+      txHash,
+      network: NETWORK,
+    });
   } catch (err) {
-    console.error("MindVault MCP: failed to persist purchase receipt:", safeErrorMessage(err));
+    logger.error("MindVault MCP: failed to persist purchase receipt:", safeErrorMessage(err));
   }
 
   const summary = {
@@ -1685,6 +1972,7 @@ export async function registerOnchain(
   const { Keypair, Transaction } = await import("@stellar/stellar-sdk");
   const passphrase = networkPassphrase ?? REGISTRY_NETWORK_PASSPHRASE;
   const tx = new Transaction(unsignedXdr, passphrase);
+  assertTransactionFeeWithinCeiling({ feeStroops: tx.fee });
   tx.sign(Keypair.fromSecret(wallet.secretKey));
   const signedXdr = tx.toXDR();
 
@@ -1748,26 +2036,33 @@ async function agentStatus(): Promise<string> {
   return JSON.stringify(res.data, null, 2);
 }
 
-function stroopsToUsdc(stroops: bigint): string {
-  const STROOPS_PER_USDC = 10_000_000n;
-  const negative = stroops < 0n;
-  const abs = negative ? -stroops : stroops;
-  const whole = abs / STROOPS_PER_USDC;
-  const frac = abs % STROOPS_PER_USDC;
-  return `${negative ? "-" : ""}${whole}.${frac.toString().padStart(7, "0")}`;
-}
-
+/**
+ * Decimal USDC for an on-chain stroop amount, throwing on an amount the shared
+ * converter will not accept. The registry contract takes stroops, so a price
+ * that cannot be expressed exactly must stop here rather than be rounded into
+ * a transaction (#838).
+ */
 export function usdcToStroops(usdc: string): bigint {
-  const parts = usdc.split(".");
-  const whole = BigInt(parts[0] || "0");
-  const fracStr = (parts[1] || "").padEnd(7, "0").slice(0, 7);
-  const frac = BigInt(fracStr);
-  return whole * 10_000_000n + frac;
+  const stroops = toStroops(usdc);
+  if (stroops === null) {
+    throw new Error(
+      `Invalid USDC amount "${usdc}". Use a non-negative decimal with at most 7 decimal places, e.g. "5.00".`,
+    );
+  }
+  return stroops;
 }
 
 export async function updateMetadata(resourceId: string, metadata: string): Promise<string> {
   const wallet = requireWallet();
-  if (_isMock()) return mockUpdateMetadata(resourceId, metadata);
+
+  // Normalize the metadata pointer before submitting so that equivalent
+  // HTTP(S) URLs always produce the same on-chain value, matching the
+  // normalization applied at publish time (server/src/utils/crypto.ts
+  // `hashLinkResource`/`normalizeUrl`).  Non-URL pointers (ipfs://, ar://,
+  // sha256:, 0x…) are passed through unchanged.
+  const normalizedMetadata = normalizeMetadataPointer(metadata);
+
+  if (_isMock()) return mockUpdateMetadata(resourceId, normalizedMetadata);
 
   const client = createRegistryClient({
     contractId: REGISTRY_CONTRACT_ID,
@@ -1778,7 +2073,7 @@ export async function updateMetadata(resourceId: string, metadata: string): Prom
 
   let tx: Awaited<ReturnType<typeof client.update_metadata>>;
   try {
-    tx = await client.update_metadata({ id: resourceId, metadata });
+    tx = await client.update_metadata({ id: resourceId, metadata: normalizedMetadata });
   } catch (err: any) {
     if (isTimeoutError(err)) {
       throw mcpError(
@@ -1832,6 +2127,14 @@ export async function updateMetadata(resourceId: string, metadata: string): Prom
   }
 
   const txHash = sentTx?.sendTransactionResponse?.hash ?? null;
+  recordResourceHistory({
+    resourceId,
+    kind: "metadata",
+    actor: wallet.publicKey,
+    value: metadata,
+    txHash,
+    network: NETWORK,
+  });
   return JSON.stringify(
     {
       status: "success",
@@ -1913,6 +2216,14 @@ export async function setPrice(resourceId: string, price: string): Promise<strin
   }
 
   const txHash = sentTx?.sendTransactionResponse?.hash ?? null;
+  recordResourceHistory({
+    resourceId,
+    kind: "price",
+    actor: wallet.publicKey,
+    value: price,
+    txHash,
+    network: NETWORK,
+  });
   return JSON.stringify(
     {
       status: "success",
@@ -1992,6 +2303,14 @@ export async function transferOwnership(resourceId: string, newCreator: string):
   }
 
   const txHash = sentTx?.sendTransactionResponse?.hash ?? null;
+  recordResourceHistory({
+    resourceId,
+    kind: "transferred",
+    actor: wallet.publicKey,
+    recipient: newCreator,
+    txHash,
+    network: NETWORK,
+  });
   return JSON.stringify(
     {
       status: "success",
@@ -2081,6 +2400,80 @@ export async function setListed(resourceId: string, listed: boolean): Promise<st
     null,
     2,
   );
+}
+
+export async function setTags(resourceId: string, tags: string[]): Promise<string> {
+  const wallet = requireWallet();
+  if (_isMock()) return mockSetTags(resourceId, tags);
+
+  const client = createRegistryClient({
+    contractId: REGISTRY_CONTRACT_ID,
+    rpcUrl: SOROBAN_RPC_URL,
+    networkPassphrase: REGISTRY_NETWORK_PASSPHRASE,
+    publicKey: wallet.publicKey,
+  });
+
+  let tx: Awaited<ReturnType<typeof client.set_tags>>;
+  try {
+    tx = await client.set_tags({ id: resourceId, tags });
+  } catch (err: any) {
+    if (isTimeoutError(err)) {
+      throw mcpError(
+        mapTransportError({
+          operation: `Set tags failed for resource "${resourceId}"`,
+          source: "soroban",
+          error: err,
+        }),
+      );
+    }
+    throw mcpError(
+      mapRegistryError({
+        operation: `Set tags failed for resource "${resourceId}"`,
+        message: err?.message || String(err),
+      }),
+    );
+  }
+
+  const result = tx.result;
+  if (result.isErr()) {
+    const err = result.unwrapErr();
+    const notFound = err.message === RegistryErrors[2].message;
+    throw mcpError(
+      mapRegistryError({
+        operation: `Set tags failed for resource "${resourceId}"`,
+        message: err.message,
+        notFound,
+      }),
+    );
+  }
+
+  const { Keypair } = await import("@stellar/stellar-sdk");
+  const keypair = Keypair.fromSecret(wallet.secretKey);
+  let sentTx;
+  try {
+    sentTx = await tx.signAndSend({
+      signTransaction: async (xdr: string) => {
+        const { Transaction } = await import("@stellar/stellar-sdk");
+        const stellarTx = new Transaction(xdr, REGISTRY_NETWORK_PASSPHRASE);
+        stellarTx.sign(keypair);
+        return { signedTxXdr: stellarTx.toXDR() };
+      },
+    });
+  } catch (err: any) {
+    throw mcpError(
+      mapRegistryError({
+        operation: `Set tags submission failed for resource "${resourceId}"`,
+        message: err?.message || String(err),
+      }),
+    );
+  }
+
+  const txHash = sentTx?.sendTransactionResponse?.hash ?? null;
+  return [
+    `Tags updated for resource "${resourceId}".`,
+    `Tags: ${tags.length > 0 ? tags.join(", ") : "(none)"}`,
+    `Tx hash: ${txHash ?? "pending"}`,
+  ].join("\n");
 }
 
 export async function registryLookup(resourceId: string): Promise<string> {
@@ -2235,285 +2628,87 @@ export async function registryList(start: number, limit: number): Promise<string
   );
 }
 
-/**
- * Look up several catalog resources in one call (#608).
- *
- * Each id is resolved exactly like `mindvault_preview` — same endpoint, same
- * offline fallback to the last recorded snapshot, same staleness labelling —
- * but a miss here is a *result* (`found: false`), not an error: one unknown id
- * must not sink a batch that is otherwise answerable. Deduplicated up front so
- * a repeated id costs one lookup, and the advertised batch ceiling (25) keeps
- * the fan-out bounded.
- */
-async function batchCatalogLookupOutcome(
-  resourceIds: string[],
-  refetch: boolean,
-): Promise<ToolOutcome> {
-  const uniqueIds = [...new Set(resourceIds)];
+export async function registryCount(creator?: string): Promise<string> {
+  if (_isMock()) return mockRegistryCount(creator, REGISTRY_CONTRACT_ID);
 
-  // Offline fallback: resolve what the last recorded snapshots can answer.
-  // Called when the freshness probe proves the API unreachable (or refetch is
-  // false and the probe failed for any reason); throws a classified error when
-  // no snapshot can answer any part of the batch.
-  const resolveOffline = async (): Promise<Map<string, { meta: any; savedAtMs: number }>> => {
-    const fromCache = new Map<string, { meta: any; savedAtMs: number }>();
-    for (const id of uniqueIds) {
-      const snap = getPreviewSnapshot(id);
-      if (snap) fromCache.set(id, { meta: snap.meta, savedAtMs: snap.savedAtMs });
-    }
-    if (fromCache.size === 0) {
-      throw mcpError(
-        mapTransportError({
-          operation: `Batch lookup failed for ${uniqueIds.length} resource(s) and no cached snapshot is available`,
-          source: "api",
-          error: new Error("catalog API unreachable"),
-        }),
-      );
-    }
-    return fromCache;
-  };
+  const client = createRegistryClient({
+    contractId: REGISTRY_CONTRACT_ID,
+    rpcUrl: SOROBAN_RPC_URL,
+    networkPassphrase: REGISTRY_NETWORK_PASSPHRASE,
+  });
 
-  const cached = new Map<string, { meta: any; savedAtMs: number }>();
-  const snapshotServed: string[] = [];
+  let count: number;
+  let listedCount: number;
+  let creatorCount: number | null = null;
+
   try {
-    // Freshness probe: a cheap single-id read exercises the same transport as
-    // the batch. Its outcome settles the first id (hit or miss), so no id pays
-    // for a second request; any other status means the API, not the id,
-    // failed — the offline fallback below decides whether that is survivable.
-    const probe = await jsonFetch(`${BASE_URL}/resources/${uniqueIds[0]}/meta`);
-    if (!probe.ok && probe.status !== 404) {
-      throwHttpError({
-        operation: "Batch lookup failed",
-        source: "api",
-        status: probe.status,
-        data: probe.data,
-      });
-    }
-    if (probe.ok) recordPreviewSnapshot(uniqueIds[0], probe.data);
-    for (const id of uniqueIds) {
-      if (id === uniqueIds[0]) {
-        if (probe.ok) {
-          cached.set(id, { meta: probe.data, savedAtMs: Date.now() });
-        } else if (!refetch) {
-          // 404 for the probe id: same per-id semantics as every other id —
-          // the last snapshot can still answer (mirrors previewData), unless
-          // refetch asked for fresh answers only.
-          const snap = getPreviewSnapshot(id);
-          if (snap) {
-            cached.set(id, { meta: snap.meta, savedAtMs: snap.savedAtMs });
-            snapshotServed.push(id);
-          }
-        }
-        continue;
-      }
-      // Per-id semantics mirror previewData: any failure to read one id —
-      // a 404, an API error status, or a transport error while the probe is
-      // healthy — degrades that id to a snapshot-or-miss instead of failing
-      // the batch. Only the probe decides whether the API as a whole is
-      // unreachable, and refetch refuses the snapshot everywhere.
-      try {
-        const res = await jsonFetch(`${BASE_URL}/resources/${id}/meta`);
-        if (res.ok) {
-          recordPreviewSnapshot(id, res.data);
-          cached.set(id, { meta: res.data, savedAtMs: Date.now() });
-          continue;
-        }
-      } catch {
-        // Mid-batch transport failure while the probe is healthy: degrade
-        // this id below; never escalate to the batch-level offline path,
-        // because the API as a whole is reachable.
-      }
-      if (!refetch) {
-        const snap = getPreviewSnapshot(id);
-        if (snap) {
-          cached.set(id, { meta: snap.meta, savedAtMs: snap.savedAtMs });
-          snapshotServed.push(id);
-        }
-      }
-    }
-  } catch (err) {
-    if (refetch) throw err;
-    const offline = await resolveOffline();
-    for (const [id, entry] of offline) {
-      cached.set(id, entry);
-      snapshotServed.push(id);
-    }
-  }
-
-  // The snapshot notice is claimed per id, not per batch: it lists exactly
-  // the ids that were answered from cache, so it never labels data that was
-  // read live. Mixed batches (a fresh probe plus later failures) therefore
-  // name the degraded subset.
-  let notice: string | null = null;
-  if (snapshotServed.length > 0) {
-    const oldestServed = Math.min(
-      ...snapshotServed.map((id) => cached.get(id)!.savedAtMs),
-    );
-    notice = catalogCacheLabel(oldestServed);
-    if (snapshotServed.length < uniqueIds.length) {
-      notice = `${notice} (served from cache: ${snapshotServed.join(", ")})`;
-    }
-  }
-
-  const missing: string[] = [];
-  const bodyLines: string[] = [];
-  const items: Array<{
-    id: string;
-    found: boolean;
-    title: string | null;
-    price: string | number | null;
-    verificationStatus: string | null;
-    resourceType: string | null;
-    accessUrl: string | null;
-  }> = [];
-
-  for (const id of uniqueIds) {
-    const entry = cached.get(id);
-    if (!entry || !entry.meta) {
-      missing.push(id);
-      items.push({
-        id,
-        found: false,
-        title: null,
-        price: null,
-        verificationStatus: null,
-        resourceType: null,
-        accessUrl: null,
-      });
-      bodyLines.push(`[${id}] not found in the catalog.`);
-      continue;
-    }
-    const r = entry.meta;
-    items.push({
-      id,
-      found: true,
-      title: r?.title ?? null,
-      price: r?.price ?? null,
-      verificationStatus: r?.verificationStatus ?? null,
-      resourceType: r?.resourceType ?? null,
-      accessUrl: r?.accessUrl ?? null,
-    });
-    bodyLines.push(
-      `[${r.id ?? id}] ${r?.title ?? "(untitled)"} — $${r?.price ?? "?"} USDC\n  ${r?.description ?? ""}\n  ${r?.accessUrl ?? ""}`,
+    const countTx = await client.count();
+    count = Number(countTx.result);
+  } catch (err: unknown) {
+    throw mcpError(
+      mapTransportError({
+        operation: `Registry count() failed (contract ${REGISTRY_CONTRACT_ID}, RPC ${SOROBAN_RPC_URL})`,
+        source: "soroban",
+        error: err,
+      }),
     );
   }
 
-  const body = bodyLines.join("\n\n");
-  const full = notice ? `${body}\n\n${notice}` : body;
-  const text = truncateResponse(full);
-  return {
-    text,
-    structured: {
-      items,
-      requested: uniqueIds.length,
-      foundCount: items.filter((i) => i.found).length,
-      missing,
-      notice,
-      truncated: text !== full,
-    },
-  };
-}
+  try {
+    // listed_count is present in the Rust contract but not yet included in the
+    // generated TypeScript bindings; access via `as any` until bindings are
+    // regenerated with `pnpm contract:bindings`.
+    const listedTx = await (client as any).listed_count();
+    listedCount = Number(listedTx.result);
+  } catch (err: unknown) {
+    throw mcpError(
+      mapTransportError({
+        operation: `Registry listed_count() failed (contract ${REGISTRY_CONTRACT_ID}, RPC ${SOROBAN_RPC_URL})`,
+        source: "soroban",
+        error: err,
+      }),
+    );
+  }
 
-export async function batchCatalogLookup(
-  resourceIds: string[],
-  refetch: boolean,
-): Promise<string> {
-  return outcomeText(await batchCatalogLookupOutcome(resourceIds, refetch));
-}
-
-/**
- * Preview the content digest anchored in a resource's on-chain metadata
- * pointer (#604), without comparing it against anything or buying the
- * resource.
- *
- * Reads the same on-chain row `mindvault_check_consistency` reads, then hands
- * the pointer to the shared `describeMetadataPointerHash` reporter so the
- * reason strings match that tool's report exactly. Unknown ids surface the
- * registry client's own not-found error rather than a synthetic report — an
- * id that does not exist is an input problem, not a digest problem.
- */
-async function previewMetadataHashOutcome(resourceId: string): Promise<ToolOutcome> {
-  let pointer: unknown;
-  let source: string | null = null;
-
-  if (_isMock()) {
-    const raw = mockRegistryLookup(resourceId, REGISTRY_CONTRACT_ID, currentWallet()?.publicKey);
-    const parsed = JSON.parse(raw);
-    if (!parsed.found) {
-      // Same semantics as the live path: an id that is not registered on-chain
-      // is an input problem, not a digest problem.
-      throw mcpError(
-        mapRegistryError({
-          operation: `Metadata hash preview for resource "${resourceId}"`,
-          message: `Resource "${resourceId}" is not registered on-chain.`,
-          notFound: true,
-        }),
-      );
-    }
-    pointer = parsed.metadata;
-    source = "on-chain (mock)";
-  } else {
-    const client = createRegistryClient({
-      contractId: REGISTRY_CONTRACT_ID,
-      rpcUrl: SOROBAN_RPC_URL,
-      networkPassphrase: REGISTRY_NETWORK_PASSPHRASE,
-    });
-    let tx: Awaited<ReturnType<typeof client.get>>;
+  if (creator) {
     try {
-      tx = await client.get({ id: resourceId });
-    } catch (err: any) {
+      const creatorTx = await (client as any).creator_resource_count({ creator });
+      creatorCount = Number(creatorTx.result);
+    } catch (err: unknown) {
       throw mcpError(
         mapTransportError({
-          operation: `Metadata hash preview failed for resource "${resourceId}" (contract ${REGISTRY_CONTRACT_ID}, RPC ${SOROBAN_RPC_URL})`,
+          operation: `Registry creator_resource_count() failed for "${creator}" (contract ${REGISTRY_CONTRACT_ID}, RPC ${SOROBAN_RPC_URL})`,
           source: "soroban",
           error: err,
         }),
       );
     }
-    if (tx.result.isErr()) {
-      const err = tx.result.unwrapErr();
-      if (err.message === RegistryErrors[2].message) {
-        throw mcpError(
-          mapRegistryError({
-            operation: `Metadata hash preview for resource "${resourceId}"`,
-            message: err.message,
-            notFound: true,
-          }),
-        );
-      }
-      throw mcpError(
-        mapRegistryError({
-          operation: `Contract error for resource "${resourceId}" (contract ${REGISTRY_CONTRACT_ID}, network ${REGISTRY_NETWORK_PASSPHRASE})`,
-          message: err.message,
-        }),
-      );
-    }
-    pointer = tx.result.unwrap().metadata;
-    source = "on-chain";
   }
 
-  const report = describeMetadataPointerHash(pointer);
-  const structured = {
-    resourceId,
-    pointer: { source, present: typeof pointer === "string" && pointer.trim() !== "" },
-    report,
+  const payload: {
+    source: string;
+    count: number;
+    listedCount: number;
+    creatorCount?: number;
+    creator?: string;
+    contract: string;
+    network: string;
+    rpc: string;
+  } = {
+    source: "on-chain",
+    count,
+    listedCount,
+    contract: REGISTRY_CONTRACT_ID,
+    network: REGISTRY_NETWORK_PASSPHRASE,
+    rpc: SOROBAN_RPC_URL,
   };
-  const lines = [
-    `Resource: ${resourceId}`,
-    `Metadata pointer source: ${source ?? "none"}`,
-    `Digest anchored: ${report.present ? "yes" : "no"}`,
-  ];
-  if (report.present && report.valid) {
-    lines.push(`Algorithm: ${report.algorithm}`, `Canonical digest: ${report.canonical}`);
-  } else {
-    lines.push(`Digest: ${report.reason ?? "not anchored"}`);
-  }
-  const text = truncateResponse(lines.join("\n"));
-  return { text, structured };
-}
 
-export async function previewMetadataHash(resourceId: string): Promise<string> {
-  return outcomeText(await previewMetadataHashOutcome(resourceId));
+  if (creator != null) {
+    payload.creator = creator;
+    payload.creatorCount = creatorCount!;
+  }
+
+  return JSON.stringify(payload, null, 2);
 }
 
 export async function recoverCatalogCache(): Promise<string> {
@@ -2744,6 +2939,131 @@ export function networkProfile(): string {
   return JSON.stringify(profile, null, 2);
 }
 
+// ── #883: Client config emitter ──────────────────────────────────────────────
+// docs/mcp-client-configs.md documents copy-paste configs per client with a
+// placeholder path and testnet defaults. This mirrors that content
+// programmatically, pre-filled with this running process's actual entrypoint
+// path and whichever environment values were actually detected (so an agent
+// already connected to one client can generate the config for another without
+// hand-editing placeholders).
+
+type ClientConfigId = "claude-code" | "claude-desktop" | "codex" | "cursor" | "vscode" | "windsurf";
+
+const CLIENT_CONFIG_PROFILES: Record<
+  ClientConfigId,
+  { label: string; format: "json" | "toml"; topLevelKey: "mcpServers" | "servers" }
+> = {
+  "claude-code": { label: "Claude Code (.mcp.json)", format: "json", topLevelKey: "mcpServers" },
+  "claude-desktop": {
+    label: "Claude Desktop (claude_desktop_config.json)",
+    format: "json",
+    topLevelKey: "mcpServers",
+  },
+  codex: { label: "Codex (~/.codex/config.toml)", format: "toml", topLevelKey: "mcpServers" },
+  cursor: { label: "Cursor (.cursor/mcp.json)", format: "json", topLevelKey: "mcpServers" },
+  vscode: { label: "VS Code (.vscode/mcp.json)", format: "json", topLevelKey: "servers" },
+  windsurf: {
+    label: "Windsurf (~/.codeium/windsurf/mcp_config.json)",
+    format: "json",
+    topLevelKey: "mcpServers",
+  },
+};
+
+/**
+ * The path this server was actually launched with, when it looks like a real
+ * built entrypoint (ends in mcp/dist/index.js). Falls back to the same
+ * placeholder the docs use when running under a dev/test harness (tsx,
+ * vitest), where process.argv[1] isn't a useful path to hand back to a client.
+ */
+function detectEntrypointPath(): string {
+  const argv1 = process.argv[1];
+  if (argv1 && /mcp[\\/]dist[\\/]index\.js$/.test(argv1)) return argv1;
+  return "/absolute/path/to/mindvault/mcp/dist/index.js";
+}
+
+/** Non-default environment values worth carrying into a generated config. */
+function detectConfigEnv(): Record<string, string> {
+  const env: Record<string, string> = { STELLAR_NETWORK };
+  const passthrough = [
+    "MINDVAULT_URL",
+    "SPONSORED_ACCOUNT_URL",
+    "SOROBAN_RPC_URL",
+    "HORIZON_URL",
+    "USDC_CONTRACT_ID",
+    "VAULT_REGISTRY_CONTRACT_ID",
+    "MINDVAULT_ALLOW_MAINNET",
+  ] as const;
+  for (const key of passthrough) {
+    const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  return env;
+}
+
+function buildClientConfigSnippet(
+  clientId: ClientConfigId,
+  entrypoint: string,
+  env: Record<string, string>,
+): string {
+  const profile = CLIENT_CONFIG_PROFILES[clientId];
+  const serverName = env.STELLAR_NETWORK === "mainnet" ? "mindvault-mainnet" : "mindvault";
+
+  if (profile.format === "toml") {
+    const lines = [`[mcp_servers.${serverName}]`, `command = "node"`, `args = ["${entrypoint}"]`];
+    if (Object.keys(env).length > 0) {
+      lines.push("", `[mcp_servers.${serverName}.env]`);
+      for (const [key, value] of Object.entries(env)) lines.push(`${key} = "${value}"`);
+    }
+    return lines.join("\n");
+  }
+
+  const body: Record<string, unknown> = {
+    ...(clientId === "vscode" ? { type: "stdio" } : {}),
+    command: "node",
+    args: [entrypoint],
+    env,
+  };
+  return JSON.stringify({ [profile.topLevelKey]: { [serverName]: body } }, null, 2);
+}
+
+/**
+ * Emit a copy-paste MCP client config for one client (or every supported
+ * client when omitted), using this server's detected entrypoint path and
+ * network profile instead of the placeholders in docs/mcp-client-configs.md.
+ */
+export function clientConfig(client?: string): string {
+  const entrypoint = detectEntrypointPath();
+  const env = detectConfigEnv();
+
+  if (client !== undefined) {
+    if (!(client in CLIENT_CONFIG_PROFILES)) {
+      const known = Object.keys(CLIENT_CONFIG_PROFILES).join(", ");
+      throw new Error(`Unknown client "${client}". Supported clients: ${known}.`);
+    }
+    const id = client as ClientConfigId;
+    const fence = CLIENT_CONFIG_PROFILES[id].format;
+    return [
+      `## ${CLIENT_CONFIG_PROFILES[id].label}`,
+      "",
+      "```" + fence,
+      buildClientConfigSnippet(id, entrypoint, env),
+      "```",
+    ].join("\n");
+  }
+
+  const sections = (Object.keys(CLIENT_CONFIG_PROFILES) as ClientConfigId[]).map((id) => {
+    const fence = CLIENT_CONFIG_PROFILES[id].format;
+    return [
+      `## ${CLIENT_CONFIG_PROFILES[id].label}`,
+      "",
+      "```" + fence,
+      buildClientConfigSnippet(id, entrypoint, env),
+      "```",
+    ].join("\n");
+  });
+  return sections.join("\n\n");
+}
+
 /**
  * Verify the installed registry-client bindings match the deployed contract's
  * interface. Returns the check's deterministic, agent-safe message.
@@ -2789,8 +3109,10 @@ function isDispatchableTool(name: string): boolean {
 const STATE_MUTATING_TOOLS = new Set([
   "mindvault_setup_wallet",
   "mindvault_use_profile",
+  "mindvault_switch_network_profile",
   "mindvault_register",
   "mindvault_publish",
+  "mindvault_publish_batch",
   "mindvault_buy",
   "mindvault_register_onchain",
   "mindvault_update_metadata",
@@ -2798,6 +3120,8 @@ const STATE_MUTATING_TOOLS = new Set([
   "mindvault_transfer_ownership",
   "mindvault_set_listed",
   "mindvault_set_tags",
+  "mindvault_freeze",
+  "mindvault_royalty",
   "mindvault_reset",
   "mindvault_restore_state",
   "mindvault_import_wallet",
@@ -2859,6 +3183,11 @@ async function dispatchToolOutcome(
         return walletInfoOutcome();
       case "mindvault_use_profile":
         return useProfileOutcome(requiredString(args, "name"));
+      case "mindvault_switch_network_profile":
+        return switchNetworkProfile(
+          requiredString(args, "name"),
+          requiredString(args, "network") as "testnet" | "mainnet",
+        );
       case "mindvault_list_profiles":
         return listProfilesOutcome();
       case "mindvault_browse": {
@@ -2887,6 +3216,33 @@ async function dispatchToolOutcome(
         });
       case "mindvault_publish_status":
         return publishStatus(rawRecord, onProgress);
+      case "mindvault_publish_batch": {
+        const batchItems = rawRecord.items;
+        if (!Array.isArray(batchItems) || batchItems.length === 0) {
+          throw new Error("mindvault_publish_batch: items must be a non-empty array.");
+        }
+        const typedItems: BatchPublishItem[] = batchItems.map((item: any, i: number) => {
+          if (!item || typeof item !== "object") {
+            throw new Error(`mindvault_publish_batch: items[${i}] must be an object.`);
+          }
+          if (typeof item.title !== "string" || item.title.trim() === "") {
+            throw new Error(`mindvault_publish_batch: items[${i}].title must be a non-empty string.`);
+          }
+          if (typeof item.price !== "string" || item.price.trim() === "") {
+            throw new Error(`mindvault_publish_batch: items[${i}].price must be a non-empty string.`);
+          }
+          if (typeof item.externalUrl !== "string" || item.externalUrl.trim() === "") {
+            throw new Error(`mindvault_publish_batch: items[${i}].externalUrl must be a non-empty string.`);
+          }
+          return {
+            title: item.title,
+            description: typeof item.description === "string" ? item.description : undefined,
+            price: item.price,
+            externalUrl: item.externalUrl,
+          };
+        });
+        return publishBatch(typedItems, onProgress);
+      }
       case "mindvault_buy":
         return buy(
           requiredString(dryRunArgs, "resourceId"),
@@ -2898,7 +3254,10 @@ async function dispatchToolOutcome(
       case "mindvault_purchase_history":
         return purchaseHistoryTool(rawRecord);
       case "mindvault_export_receipts":
-        return exportReceiptsTool(rawRecord);
+        return exportReceiptsToolWithTimeout(
+          rawRecord,
+          timeoutForTool("mindvault_export_receipts", "http", TIMEOUTS, TOOL_TIMEOUTS),
+        );
       case "mindvault_register_onchain":
         return registerOnchain(requiredString(args, "resourceId"), onProgress);
       case "mindvault_agent_status":
@@ -2928,6 +3287,8 @@ async function dispatchToolOutcome(
           optionalInt(args, "start", REGISTRY_LIST_DEFAULT_START),
           optionalInt(args, "limit", REGISTRY_LIST_DEFAULT_LIMIT),
         );
+      case "mindvault_registry_count":
+        return registryCount(optionalString(args, "creator"));
       case "mindvault_update_metadata":
         return updateMetadata(requiredString(args, "resourceId"), requiredString(args, "metadata"));
       case "mindvault_set_price":
@@ -2939,12 +3300,18 @@ async function dispatchToolOutcome(
         );
       case "mindvault_set_listed":
         return setListed(requiredString(args, "resourceId"), flag(args, "listed"));
+      case "mindvault_set_tags":
+        return setTags(requiredString(args, "resourceId"), requiredTagArray(args, "tags"));
       case "mindvault_tx_status":
         return txStatus(requiredString(args, "txHash"));
       case "mindvault_reset":
         return resetState(flag(args, "all"), rawRecord.confirm);
       case "mindvault_backup_state":
-        return backupState(requiredString(args, "passphrase"));
+        return backupState(requiredString(args, "passphrase"), rawRecord.confirm);
+      case "mindvault_resource_provenance":
+        return provenanceChain(requiredString(args, "resourceId"));
+      case "mindvault_resource_change_log":
+        return resourceChangeLog(requiredString(args, "resourceId"));
       case "mindvault_restore_state":
         return restoreStateTool(requiredString(args, "blob"), requiredString(args, "passphrase"));
       case "mindvault_metrics":
@@ -2953,6 +3320,12 @@ async function dispatchToolOutcome(
         return checkStatePermissionsTool();
       case "mindvault_registry_health":
         return registryHealth();
+      case "mindvault_prewarm_catalog":
+        return prewarmCatalogCache();
+      case "mindvault_client_config":
+        return clientConfig(optionalString(args, "client"));
+      case "mindvault_mainnet_banner":
+        return mainnetBanner();
       case "mindvault_import_wallet":
         return importWallet({
           secretKey: optionalString(args, "secretKey"),
@@ -2963,6 +3336,8 @@ async function dispatchToolOutcome(
         return rotatePublisherKey(optionalString(args, "profile"));
       case "mindvault_verify_install":
         return formatVerifyInstall(verifyInstall(process.env));
+      case "mindvault_debug_bundle":
+        return debugBundleTool(rawRecord);
       case "mindvault_recover_catalog_cache":
         return recoverCatalogCache();
       default:
@@ -3071,7 +3446,7 @@ if (!process.env.VITEST && !MOCK) {
     network: STELLAR_NETWORK,
   })
     .then((result: { status: string; message: string }) => {
-      if (result.status === "mismatch") console.error(`MindVault MCP: ${result.message}`);
+      if (result.status === "mismatch") logger.warn(`MindVault MCP: ${result.message}`);
     })
     .catch(() => {});
 }
@@ -3105,6 +3480,13 @@ if (!process.env.VITEST) {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
   process.stdin.on("end", () => shutdown("stdin-EOF"));
+
+  // Best-effort catalog cache pre-warm (#882). Fire-and-forget: never blocks
+  // startup and never crashes the process if the API is unreachable — a
+  // failed pre-warm just means the first mindvault_browse pays the normal
+  // cold-cache cost, which is the status quo this is improving on, not a
+  // regression.
+  prewarmCatalogCache().catch(() => {});
 
   await server.connect(transport);
 }
