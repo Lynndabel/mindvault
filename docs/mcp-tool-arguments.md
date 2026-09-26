@@ -135,6 +135,7 @@ accepted spelling the agent used:
 | flag                   | coerced to a real boolean     |
 | `txHash`               | lowercased bare hex           |
 | `expectedMetadataHash` | canonical `sha256:<hex>` form |
+| string_array           | per-entry trimmed, empties dropped; case and duplicates kept (unlike `tag_array`, entries are data selectors, not on-chain tags) |
 
 ---
 

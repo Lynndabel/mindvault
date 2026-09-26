@@ -83,6 +83,7 @@ import {
   TOOL_ARGUMENT_SPECS,
   TOOLS_WITHOUT_ARG_VALIDATION,
   UnknownToolError,
+  requiredStringArray,
   validateToolArgs,
   type ValidatedArgs,
 } from "./validation.js";
@@ -163,13 +164,13 @@ import {
   sanitizeServiceUrl,
   SPONSORED_CREATE_PATH,
 } from "./sponsoredDiagnostics.js";
+import { describeMetadataPointerHash, parseMetadataHash } from "./metadataHash.js";
 import {
   checkWalletIntegrity,
   sponsoredWalletIntegrityError,
   unownedWalletNote,
   type DerivePublicKey,
 } from "./sponsoredWallet.js";
-import { parseMetadataHash } from "./metadataHash.js";
 import {
   applyCatalogSort,
   applyClientCatalogFilters,
@@ -3274,6 +3275,13 @@ async function dispatchToolOutcome(
         );
       case "mindvault_registry_lookup":
         return registryLookup(requiredString(args, "resourceId"));
+      case "mindvault_batch_catalog_lookup":
+        return batchCatalogLookupOutcome(
+          requiredStringArray(args, "resourceIds"),
+          flag(args, "refetch"),
+        );
+      case "mindvault_preview_metadata_hash":
+        return previewMetadataHashOutcome(requiredString(args, "resourceId"));
       case "mindvault_registry_list":
         return registryList(
           optionalInt(args, "start", REGISTRY_LIST_DEFAULT_START),
