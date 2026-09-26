@@ -17,6 +17,11 @@ For client installation and configuration see
 
 **39 tools** as of last generation.
 
+> **Read-only mode:** when `MINDVAULT_READ_ONLY` is set, mutating tools
+> (`mindvault_buy`, `mindvault_setup_wallet`, `mindvault_use_profile`, …) are not
+> advertised by ListTools and are refused on dispatch. Treat them as unavailable
+> in this listing rather than planning around a later "not available" error (#845).
+
 ---
 
 ## Wallet
